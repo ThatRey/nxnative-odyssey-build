@@ -1,0 +1,122 @@
+name: Preflight
+
+# Short, game-free check of the same image, toolchain and iOS build path the
+# real build uses. Run this first so a missing Xcode/Metal/XcodeGen component
+# does not waste a multi-hour build.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+  NXNATIVE_SHA: 6bead17152aa5a00846c194410ab9b5e4019f52e
+  GAME: 010015100B514000   # Super Mario Bros. Wonder: a profile with no game files needed
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  preflight:
+    name: Toolchain and iOS smoke build
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: ci/requirements.txt
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Check the image and the toolchain
+        run: |
+          set -euo pipefail
+          sw_vers
+          uname -m
+          sysctl -n hw.ncpu hw.memsize
+          xcodebuild -version
+          xcrun --sdk iphoneos metal --version
+          python3 --version
+          dotnet --version
+          df -h /System/Volumes/Data
+          ls -d /Applications/Xcode*.app || true
+
+      - name: Remove unused Xcodes and check free disk
+        run: |
+          set -euo pipefail
+          if [ ! -d /Applications/Xcode_27.1.app ]; then
+            echo "::error::Xcode_27.1.app is missing from the image"
+            exit 1
+          fi
+          for app in /Applications/Xcode*.app; do
+            [ -d "$app" ] || continue
+            if [ "$app" != "/Applications/Xcode_27.1.app" ]; then
+              echo "removing $app"
+              sudo rm -rf "$app"
+            fi
+          done
+          sudo xcode-select -s /Applications/Xcode_27.1.app/Contents/Developer
+          sudo rm -rf "$HOME/Library/Developer/Xcode/DerivedData" \
+                      "$HOME/Library/Developer/CoreSimulator/Caches" 2>/dev/null || true
+          df -h /System/Volumes/Data
+          avail_kb="$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')"
+          avail_gib="$((avail_kb / 1024 / 1024))"
+          echo "free after cleanup: ${avail_gib} GiB"
+          if [ "$avail_gib" -lt 24 ]; then
+            echo "::warning::only ${avail_gib} GiB free; the real build needs at least 24 GiB"
+          fi
+
+      - name: Install build tools
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          set -euo pipefail
+          brew install xcodegen zstd glslang
+          python3 -m pip install -r ci/requirements.txt
+          xcodegen --version
+          zstd --version
+
+      - name: Fetch nxnative at the pinned commit
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/nxnative"
+          curl -L --fail --retry 5 -o "$RUNNER_TEMP/nxnative.tar.gz" \
+            "https://github.com/seedds/nxnative/archive/${NXNATIVE_SHA}.tar.gz"
+          tar -xzf "$RUNNER_TEMP/nxnative.tar.gz" --strip-components=1 -C "$RUNNER_TEMP/nxnative"
+          test -f "$RUNNER_TEMP/nxnative/scripts/build_ipa_from_nsp.py"
+
+      - name: Compile and link the production iOS project with synthetic inputs
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/nxnative"
+          python3 scripts/build_ipa_from_nsp.py --help >/dev/null
+          python3 dm/ios/tools/build_smoke.py --output "$RUNNER_TEMP/ios-smoke" \
+            2>&1 | tee "$RUNNER_TEMP/ios-smoke.log"
+
+      - name: Report the result
+        if: always()
+        run: |
+          set -euo pipefail
+          df -h /System/Volumes/Data
+          du -sh "$RUNNER_TEMP/ios-smoke" 2>/dev/null || true
+
+      - name: Upload the smoke log on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: preflight-log
+          path: ${{ runner.temp }}/ios-smoke.log
+          retention-days: 7
+          if-no-files-found: ignore

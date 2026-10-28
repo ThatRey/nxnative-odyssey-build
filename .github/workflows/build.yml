@@ -1,0 +1,220 @@
+name: Build Odyssey IPA
+
+# Triggered by run.sh after the local file server and Cloudflare tunnel are up.
+# Game files, prod.keys and the finished IPA never touch GitHub: the runner
+# downloads them over the token-protected tunnel and serves the IPA back the
+# same way. Only this workflow and its logs live in the repository.
+
+on:
+  workflow_dispatch:
+    inputs:
+      game_url:
+        description: Base URL of the local game server (https://...trycloudflare.com)
+        required: true
+        type: string
+      callback_url:
+        description: Local callback URL (https://...trycloudflare.com/callback)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: odyssey-build
+  cancel-in-progress: false
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+  NXNATIVE_SHA: 6bead17152aa5a00846c194410ab9b5e4019f52e
+  GAME_DIR: ${{ github.workspace }}/game
+  OUT_DIR: ${{ github.workspace }}/out
+  IPA_NAME: SuperMarioOdyssey.ipa
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build Super Mario Odyssey IPA
+    runs-on: xcode-27
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: ci/requirements.txt
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Check the image and the toolchain
+        run: |
+          set -euo pipefail
+          sw_vers
+          uname -m
+          sysctl -n hw.ncpu hw.memsize
+          xcodebuild -version
+          xcrun --sdk iphoneos metal --version
+          python3 --version
+          dotnet --version
+          df -h /System/Volumes/Data
+          ls -d /Applications/Xcode*.app || true
+
+      - name: Remove unused Xcodes and check free disk
+        run: |
+          set -euo pipefail
+          if [ ! -d /Applications/Xcode_27.1.app ]; then
+            echo "::error::Xcode_27.1.app is missing from the image"
+            exit 1
+          fi
+          for app in /Applications/Xcode*.app; do
+            [ -d "$app" ] || continue
+            if [ "$app" != "/Applications/Xcode_27.1.app" ]; then
+              echo "removing $app"
+              sudo rm -rf "$app"
+            fi
+          done
+          sudo xcode-select -s /Applications/Xcode_27.1.app/Contents/Developer
+          sudo rm -rf "$HOME/Library/Developer/Xcode/DerivedData" \
+                      "$HOME/Library/Developer/CoreSimulator/Caches" 2>/dev/null || true
+          df -h /System/Volumes/Data
+          avail_kb="$(df -k /System/Volumes/Data | awk 'NR==2 {print $4}')"
+          avail_gib="$((avail_kb / 1024 / 1024))"
+          echo "free after cleanup: ${avail_gib} GiB"
+          if [ "$avail_gib" -lt 24 ]; then
+            echo "::error::only ${avail_gib} GiB free; need at least 24 GiB for the NSPs, extracted files and IPA"
+            exit 1
+          fi
+
+      - name: Install build tools
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          set -euo pipefail
+          brew install xcodegen zstd glslang
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -L --fail --retry 5 -o "$RUNNER_TEMP/cloudflared.tgz" \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz
+          tar -xzf "$RUNNER_TEMP/cloudflared.tgz" -C "$RUNNER_TEMP/bin"
+          chmod +x "$RUNNER_TEMP/bin/cloudflared"
+          "$RUNNER_TEMP/bin/cloudflared" --version
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          python3 -m pip install -r ci/requirements.txt
+
+      - name: Fetch nxnative at the pinned commit
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/nxnative"
+          curl -L --fail --retry 5 -o "$RUNNER_TEMP/nxnative.tar.gz" \
+            "https://github.com/seedds/nxnative/archive/${NXNATIVE_SHA}.tar.gz"
+          tar -xzf "$RUNNER_TEMP/nxnative.tar.gz" --strip-components=1 -C "$RUNNER_TEMP/nxnative"
+          test -f "$RUNNER_TEMP/nxnative/scripts/build_ipa_from_nsp.py"
+          du -sh "$RUNNER_TEMP/nxnative"
+
+      - name: Download the game over the local tunnel
+        env:
+          BUILD_TOKEN: ${{ secrets.BUILD_TOKEN }}
+          GAME_URL: ${{ inputs.game_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GAME_DIR/keys"
+          fetch() {
+            local name="$1" expected="$2" out="$GAME_DIR/$1" actual
+            for attempt in 1 2 3 4 5 6; do
+              if [ -f "$out" ]; then
+                actual="$(stat -f %z "$out")"
+                if [ "$expected" != "0" ] && [ "$actual" = "$expected" ]; then
+                  echo "$name: already complete ($actual bytes)"
+                  return 0
+                fi
+              fi
+              echo "downloading $name (attempt $attempt)"
+              if curl --fail --location --silent --show-error \
+                   --retry 20 --retry-all-errors --retry-delay 5 \
+                   --connect-timeout 30 --speed-limit 1024 --speed-time 300 \
+                   --continue-at - --output "$out" \
+                   -H "Authorization: Bearer $BUILD_TOKEN" \
+                   "$GAME_URL/$name"; then
+                break
+              fi
+              sleep 10
+            done
+            [ -f "$out" ] || { echo "::error::$name did not download"; exit 1; }
+            actual="$(stat -f %z "$out")"
+            if [ "$expected" != "0" ] && [ "$actual" != "$expected" ]; then
+              echo "::error::$name is $actual bytes, expected $expected"
+              exit 1
+            fi
+            echo "$name: $actual bytes"
+          }
+          fetch base.nsp 5611009601
+          fetch update.nsp 597182843
+          fetch prod.keys 0
+          test -s "$GAME_DIR/prod.keys"
+          df -h /System/Volumes/Data
+
+      - name: Build the IPA
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/nxnative"
+          mkdir -p "$OUT_DIR"
+          python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" \
+            -k "$GAME_DIR/prod.keys" \
+            -o "$OUT_DIR/$IPA_NAME" \
+            --app-name "Super Mario Odyssey" \
+            --gpu none \
+            --no-keep-extracted \
+            --progress lines
+          test -s "$OUT_DIR/$IPA_NAME"
+          ls -lh "$OUT_DIR/$IPA_NAME"
+          df -h /System/Volumes/Data
+
+      - name: Free the game files before serving the IPA
+        run: |
+          set -euo pipefail
+          rm -rf "$GAME_DIR"
+          df -h /System/Volumes/Data
+
+      - name: Offer the IPA to the local machine
+        env:
+          BUILD_TOKEN: ${{ secrets.BUILD_TOKEN }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/ci/runner_serve.py" \
+            --file "$OUT_DIR/$IPA_NAME" \
+            --port 8001 \
+            --token "$BUILD_TOKEN" \
+            --callback-url "$CALLBACK_URL" \
+            --timeout 14400
+
+      - name: Collect failure logs
+        if: failure()
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/failure-logs"
+          shopt -s nullglob
+          for f in "$GAME_DIR"/*_build/logs/*.log; do
+            tail -n 200 "$f" > "$RUNNER_TEMP/failure-logs/$(basename "$f")"
+          done
+          ls -lh "$RUNNER_TEMP/failure-logs" || true
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: failure-logs
+          path: ${{ runner.temp }}/failure-logs
+          retention-days: 7
+          if-no-files-found: ignore
